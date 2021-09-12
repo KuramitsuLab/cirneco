@@ -8,6 +8,7 @@ from torch import Tensor
 from typing import Iterable, List
 # import sentencepiece as spm
 # import io
+import numpy as np
 import math
 import vocab
 
@@ -160,10 +161,8 @@ def greedy_decode(model, src, src_mask, max_len, beamsize, start_symbol):
                     .type(torch.bool)).to(DEVICE)
         out = model.decode(ys, memory, tgt_mask)
         out = out.transpose(0, 1)
-        prob = model.generator(out[:, -1])   # prob.size() の実行結果 : torch.Size([1, 1088]) => 1088 はTGT のVOCAV_SIZE
+        prob = model.generator(out[:, -1])
         next_prob, next_word = prob.topk(k=beamsize, dim=1)
-        # print(next_word)
-        # print(next_prob)
 
         next_word = next_word[:, 0]     # greedy なので、もっとも確率が高いものを選ぶ
         next_word = next_word.item()   # 要素の値を取得 (int に変換)
@@ -174,6 +173,76 @@ def greedy_decode(model, src, src_mask, max_len, beamsize, start_symbol):
             break
     return ys
 
+def beam_topk(model, ys, memory, beamsize):
+    ys = ys.to(DEVICE)
+
+    tgt_mask = (generate_square_subsequent_mask(ys.size(0)).type(torch.bool)).to(DEVICE)
+    out = model.decode(ys, memory, tgt_mask)
+    out = out.transpose(0, 1)
+    prob = model.generator(out[:, -1])
+    next_prob, next_word = prob.topk(k=beamsize, dim=1)
+    
+    return next_prob, next_word
+
+def beam_decode(model, src, src_mask, max_len, beamsize, start_symbol):
+    src = src.to(DEVICE)
+    src_mask = src_mask.to(DEVICE)
+
+    ys_result = {}
+
+    memory = model.encode(src, src_mask).to(DEVICE)   # encode の出力 (コンテキストベクトル)
+
+    # 初期値 (beamsize)
+    ys = torch.ones(1, 1).fill_(start_symbol).type(torch.long).to(DEVICE)
+
+    next_prob, next_word = beam_topk(model, ys, memory, beamsize)
+    next_prob = next_prob[0].tolist()
+
+    # <sos> + 1文字目 の候補 (list の長さはbeamsizeの数)
+    ys = [torch.cat([ys, torch.ones(1, 1).type_as(src.data).fill_(next_word[:, idx].item())], dim=0) for idx in range(beamsize)]
+
+    for i in range(max_len-1):
+        prob_list = []
+        ys_list = []
+
+        # それぞれの候補ごとに次の予測トークンとその確率を計算
+        for ys_token in ys:
+            next_prob, next_word = beam_topk(model, ys_token, memory, len(ys))
+
+            # 予測確率をリスト (next_prob) に代入
+            next_prob = next_prob[0].tolist()
+            # 1つのリストに結合
+            prob_list.extend(next_prob)
+
+            ys = [torch.cat([ys_token, torch.ones(1, 1).type_as(src.data).fill_(next_word[:, idx].item())], dim=0) for idx in range(len(ys))]
+            ys_list.extend(ys)
+
+        # prob_list の topk のインデックスを prob_topk_idx で保持
+        prob_topk_idx = list(reversed(np.argsort(prob_list).tolist()))
+        prob_topk_idx = prob_topk_idx[:len(ys)]
+
+        # ys に新たな topk 候補を代入
+        ys = [ys_list[idx] for idx in prob_topk_idx]
+
+        next_prob = [prob_list[idx] for idx in prob_topk_idx]
+
+        pop_list = []
+        for j in range(len(ys)):
+            # EOS トークンが末尾にあったら、ys_result (返り値) に append
+            if ys[j][-1].item() == EOS_IDX:
+                ys_result[ys[j]] = next_prob[j]
+                pop_list.append(j)
+
+        # ys_result に一度入ったら、もとの ys からは抜いておく
+        # (ys の長さが変わるので、ところどころbeamsize ではなく len(ys) を使用している箇所がある)
+        for l in sorted(pop_list, reverse=True):
+            del ys[l]
+
+        # ys_result が beamsize よりも大きかった時に、処理を終える
+        if len(ys_result) >= beamsize:
+            break
+
+    return ys_result
 
 class NMT(object):
     src_vocab: object
@@ -228,12 +297,21 @@ class NMT(object):
             self.transformer,  src, src_mask, max_len=num_tokens + 5, beamsize=5, start_symbol=SOS_IDX).flatten()
         return " ".join(self.tgt_vocab.lookup_tokens(list(tgt_tokens.cpu().numpy()))).replace("<sos>", "").replace("<eos>", "")
 
-    def translate_beam(self, src_sentence: str):
+    def translate_beam(self, src_sentence: str, beamsize=5):
         """
         複数の翻訳候補をリストで返す。
         """
         ss = []
-        ## 
+        self.transformer.eval()
+        src = self.src_transform(src_sentence).view(-1, 1)
+        num_tokens = src.shape[0]
+        src_mask = (torch.zeros(num_tokens, num_tokens)).type(torch.bool)
+        tgt_tokens = beam_decode(
+            self.transformer,  src, src_mask, max_len=num_tokens + 5, beamsize=beamsize, start_symbol=SOS_IDX)
+        prob_list = list(tgt_tokens.values())
+        tgt_tokens = list(tgt_tokens.keys())
+        for idx in list(reversed(np.argsort(prob_list).tolist())):
+            ss.append(" ".join(self.tgt_vocab.lookup_tokens(list(tgt_tokens[idx].cpu().numpy()))).replace("<sos>", "").replace("<eos>", ""))
         return ss
 
 
