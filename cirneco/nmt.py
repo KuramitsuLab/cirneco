@@ -297,7 +297,7 @@ class NMT(object):
             self.transformer,  src, src_mask, max_len=num_tokens + 5, beamsize=5, start_symbol=SOS_IDX).flatten()
         return " ".join(self.tgt_vocab.lookup_tokens(list(tgt_tokens.cpu().numpy()))).replace("<sos>", "").replace("<eos>", "")
 
-    def translate_beam(self, src_sentence: str, beamsize):
+    def translate_beam(self, src_sentence: str, beamsize=5):
         """
         複数の翻訳候補をリストで返す。
         """
